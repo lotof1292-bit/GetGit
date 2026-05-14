@@ -102,6 +102,7 @@ DETECTORS = [
     ("Cargo.toml",       ["cargo", "build"]),
     ("go.mod",           ["go", "mod", "download"]),
     ("Makefile",         ["make", "install"]),
+    ("install.ps1",      ["powershell", "-ExecutionPolicy", "Bypass", "-File", "install.ps1"]),
     ("install.sh",       ["bash", "install.sh"]),
     ("install.bat",      ["cmd", "/c", "install.bat"]),
 ]
@@ -152,6 +153,64 @@ def resolve_url(raw: str) -> str:
         clean += ".git"
     return clean
 
+def extract_readme_sections(readme_b64: str) -> dict:
+    """
+    Extrae del README:
+      - 'steps': pasos de instalación/prerequisites (listas numeradas o con bullet)
+      - 'usage': bloques de código de uso
+    """
+    import base64
+    result = {"steps": [], "usage": []}
+    try:
+        text = base64.b64decode(readme_b64).decode("utf-8", errors="replace")
+    except Exception:
+        return result
+
+    next_h_pat  = re.compile(r"^#{1,3}\s+", re.MULTILINE)
+    code_pat    = re.compile(r"[\x60]{3}(?:\w+)?\n(.*?)[\x60]{3}", re.DOTALL)
+    step_pat    = re.compile(r"^\s*(?:\d+[.)\s]|[-*]\s)(.+)", re.MULTILINE)
+
+    prereq_pat  = re.compile(
+        r"^#{1,3}\s*(prerequisite|requirement|before|depend|setup|configurar|antes de|instalar|pasos)",
+        re.IGNORECASE | re.MULTILINE)
+    usage_pat   = re.compile(
+        r"^#{1,3}\s*(usage|quick.?start|getting.?started|uso|run|running|how.?to|cómo usar|ejecutar|comandos|example)",
+        re.IGNORECASE | re.MULTILINE)
+
+    def get_section(pat):
+        m = pat.search(text)
+        if not m: return ""
+        start = m.end()
+        nxt = next_h_pat.search(text, start)
+        return text[start: nxt.start() if nxt else start + 2000]
+
+    # Pasos de instalación
+    prereq_section = get_section(prereq_pat)
+    if prereq_section:
+        steps = step_pat.findall(prereq_section)
+        result["steps"] = [s.strip() for s in steps[:8] if s.strip()]
+        # También incluir bloques de código de esa sección
+        for block in code_pat.findall(prereq_section)[:2]:
+            for line in block.strip().splitlines()[:4]:
+                l = line.strip()
+                if l: result["steps"].append(f"$ {l}")
+
+    # Comandos de uso
+    usage_section = get_section(usage_pat)
+    if usage_section:
+        blocks = code_pat.findall(usage_section)
+        result["usage"] = [b.strip() for b in blocks[:4] if b.strip()]
+    if not result["usage"]:
+        blocks = code_pat.findall(text)
+        result["usage"] = [b.strip() for b in blocks[:3] if b.strip()]
+
+    return result
+
+# kept for compat
+def extract_usage(readme_b64: str) -> list:
+    return extract_readme_sections(readme_b64)["usage"]
+
+
 def check_internet() -> bool:
     try:
         urlopen(Request("https://github.com", method="HEAD"), timeout=5)
@@ -191,6 +250,23 @@ class InstallerWorker(QThread):
             else:
                 self.sig_output.emit(f"✗ Comando no encontrado: {tool}", "err")
             return -1
+        except PermissionError:
+            # install.ps1 necesita admin — relanzar con runas
+            if "install.ps1" in str(cmd):
+                self.sig_output.emit("⚠ Se requieren permisos de Administrador — solicitando elevación...", "warn")
+                try:
+                    import ctypes
+                    script = str(Path(cwd) / "install.ps1")
+                    ctypes.windll.shell32.ShellExecuteW(
+                        None, "runas", "powershell",
+                        f'-ExecutionPolicy Bypass -File "{script}"',
+                        str(cwd), 1)
+                    self.sig_output.emit("✓ Script lanzado como Administrador — sigue las instrucciones en la ventana que abrió", "ok")
+                    return 0
+                except Exception as e:
+                    self.sig_output.emit(f"✗ No se pudo elevar permisos: {e}", "err")
+                    return -1
+            raise
         except PermissionError as e:
             self.sig_output.emit(f"✗ Permiso denegado: {e}", "err")
             return -1
@@ -411,8 +487,12 @@ class GithubPreviewWorker(QThread):
             return
         contents = self._get(f"{base}/contents") or []
         topics   = self._get(f"{base}/topics") or {}
-        meta["_files"]  = [i["name"] for i in contents if isinstance(i, dict)]
-        meta["_topics"] = topics
+        readme   = self._get(f"{base}/readme") or {}
+        meta["_files"]   = [i["name"] for i in contents if isinstance(i, dict)]
+        meta["_topics"]  = topics
+        sections         = extract_readme_sections(readme.get("content", ""))
+        meta["_usage"]   = sections["usage"]
+        meta["_steps"]   = sections["steps"]
         if not self._cancelled:
             self.sig_result.emit(meta)
 
@@ -437,6 +517,11 @@ class GetGitWindow(QWidget):
         self._build_ui()
         self._position_window()
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
+        # Timer que colapsa si la ventana pierde foco (fallback para Tool/StaysOnTop)
+        self._focus_timer = QTimer()
+        self._focus_timer.setInterval(300)
+        self._focus_timer.timeout.connect(self._check_focus)
+        self._focus_timer.start()
 
     def _position_window(self):
         screen = QApplication.primaryScreen().availableGeometry()
@@ -589,6 +674,35 @@ class GetGitWindow(QWidget):
             row_tags.addWidget(w)
         row_tags.addStretch()
         prev_lay.addLayout(row_tags)
+
+        # Comandos de uso
+        # Pasos de instalación
+        self.lbl_steps_title = QLabel("PASOS DE INSTALACIÓN")
+        self.lbl_steps_title.setStyleSheet("color:#484f58; font-size:9px; letter-spacing:2px; background:transparent; border:none; margin-top:4px;")
+        self.lbl_steps_title.setVisible(False)
+        prev_lay.addWidget(self.lbl_steps_title)
+
+        self.steps_container = QWidget()
+        self.steps_container.setStyleSheet("background:transparent;")
+        self.steps_lay = QVBoxLayout(self.steps_container)
+        self.steps_lay.setContentsMargins(0, 2, 0, 0)
+        self.steps_lay.setSpacing(2)
+        self.steps_container.setVisible(False)
+        prev_lay.addWidget(self.steps_container)
+
+        self.lbl_usage_title = QLabel("COMANDOS DE USO")
+        self.lbl_usage_title.setStyleSheet("color:#484f58; font-size:9px; letter-spacing:2px; background:transparent; border:none; margin-top:4px;")
+        self.lbl_usage_title.setVisible(False)
+        prev_lay.addWidget(self.lbl_usage_title)
+
+        self.usage_container = QWidget()
+        self.usage_container.setStyleSheet("background:transparent;")
+        self.usage_lay = QVBoxLayout(self.usage_container)
+        self.usage_lay.setContentsMargins(0, 2, 0, 0)
+        self.usage_lay.setSpacing(4)
+        self.usage_container.setVisible(False)
+        prev_lay.addWidget(self.usage_container)
+
         panel_lay.addWidget(self.frame_preview)
 
         # Destino
@@ -695,10 +809,33 @@ class GetGitWindow(QWidget):
         self.setWindowOpacity(0.82)
 
     def _on_focus_changed(self, old, now):
+        """Foco entre widgets internos."""
         if now is None: return
         w = now
         while w:
             if w is self: self._expand(); return
+            w = w.parent()
+        # Foco fue a otro widget de otra ventana Qt
+        self._collapse()
+
+    def changeEvent(self, event):
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.WindowDeactivate:
+            self._collapse()
+        super().changeEvent(event)
+
+    def _check_focus(self):
+        """Polling: colapsa si ningún widget de esta ventana tiene foco."""
+        if not self.expanded:
+            return
+        focused = QApplication.focusWidget()
+        if focused is None:
+            self._collapse()
+            return
+        w = focused
+        while w:
+            if w is self:
+                return  # foco está adentro, no colapsar
             w = w.parent()
         self._collapse()
 
@@ -810,6 +947,8 @@ class GetGitWindow(QWidget):
         self.lbl_repo_name.setText("⏳ Consultando...")
         for l in [self.lbl_stars, self.lbl_desc, self.lbl_lang, self.lbl_os, self.lbl_installer, self.lbl_license]:
             l.setText("")
+        self.lbl_steps_title.setVisible(False)
+        self.steps_container.setVisible(False)
         self._preview_timer.start(600)
 
     def _parse_owner_repo(self, url: str):
@@ -847,6 +986,76 @@ class GetGitWindow(QWidget):
         self.lbl_os.setText(f" {OS_BADGES[detect_os(files,topics)]}")
         inst = next((f for f,_ in DETECTORS if f in files), None)
         self.lbl_installer.setText(f" {inst}" if inst else "")
+
+        # Limpiar pasos previos
+        while self.steps_lay.count():
+            item = self.steps_lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        steps = data.get("_steps", [])
+        if steps:
+            self.lbl_steps_title.setVisible(True)
+            self.steps_container.setVisible(True)
+            for i, step in enumerate(steps, 1):
+                lbl_step = QLabel(f"{i}. {step}")
+                lbl_step.setWordWrap(True)
+                lbl_step.setStyleSheet("""
+                    color:#c9d1d9; background:transparent; border:none;
+                    font-size:10px; padding:1px 0;
+                """)
+                self.steps_lay.addWidget(lbl_step)
+        else:
+            self.lbl_steps_title.setVisible(False)
+            self.steps_container.setVisible(False)
+
+        # Aviso install.ps1 requiere admin
+        if "install.ps1" in files:
+            lbl_ps = QLabel("⚠ install.ps1 detectado — se ejecutará como Administrador")
+            lbl_ps.setStyleSheet("color:#e3b341; background:rgba(40,30,0,180); border:1px solid #5a4a00; border-radius:4px; padding:3px 8px; font-size:10px;")
+            lbl_ps.setWordWrap(True)
+            self.steps_lay.addWidget(lbl_ps)
+            self.lbl_steps_title.setVisible(True)
+            self.steps_container.setVisible(True)
+
+        # Limpiar comandos previos
+        while self.usage_lay.count():
+            item = self.usage_lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        usage = data.get("_usage", [])
+        if usage:
+            self.lbl_usage_title.setVisible(True)
+            self.usage_container.setVisible(True)
+            for block in usage:
+                lines = block.strip().splitlines()
+                for line in lines[:6]:  # max 6 líneas por bloque
+                    line = line.strip()
+                    if not line: continue
+                    row = QHBoxLayout()
+                    lbl_cmd = QLabel(line)
+                    lbl_cmd.setStyleSheet("""
+                        color:#e6edf3; background:rgba(1,4,9,200);
+                        border:1px solid #30363d; border-radius:4px;
+                        padding:3px 8px; font-size:10px; font-family:'Consolas','Courier New',monospace;
+                    """)
+                    lbl_cmd.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                    lbl_cmd.setCursor(Qt.CursorShape.IBeamCursor)
+                    btn_copy_cmd = QPushButton("⎘")
+                    btn_copy_cmd.setFixedSize(22, 22)
+                    btn_copy_cmd.setStyleSheet("""
+                        QPushButton{background:#21262d;border:1px solid #30363d;border-radius:4px;color:#8b949e;font-size:11px;}
+                        QPushButton:hover{background:#30363d;color:#e6edf3;}
+                    """)
+                    btn_copy_cmd.setToolTip("Copiar comando")
+                    btn_copy_cmd.clicked.connect(lambda _, l=line: (
+                        QApplication.clipboard().setText(l)
+                    ))
+                    row.addWidget(lbl_cmd)
+                    row.addWidget(btn_copy_cmd)
+                    self.usage_lay.addLayout(row)
+        else:
+            self.lbl_usage_title.setVisible(False)
+            self.usage_container.setVisible(False)
 
     # ── Instalación ───────────────────────────────────────────────────────────
     def _start_install(self):
